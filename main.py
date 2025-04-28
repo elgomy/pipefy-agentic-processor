@@ -3,11 +3,14 @@ import requests
 import logging
 from fastapi import FastAPI, Request, HTTPException, Header
 from pydantic import BaseModel, Field, HttpUrl, ValidationError
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from agentic_doc.parse import parse_documents
 from dotenv import load_dotenv
 import uuid
 import httpx
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+import sys
 
 # Configuración
 load_dotenv()
@@ -25,16 +28,16 @@ logger = logging.getLogger(__name__)
 # --- Nuevos Modelos Pydantic para el Payload card.move ---
 
 class PhaseInfo(BaseModel):
-    id: str
+    id: Union[str, int]  # Acepta tanto strings como integers
     name: str
 
 class CardInfo(BaseModel):
-    id: str
+    id: Union[str, int]  # Acepta tanto strings como integers
     title: Optional[str] = None
-    pipe_id: str
+    pipe_id: Union[str, int]  # Acepta tanto strings como integers
 
 class UserInfo(BaseModel):
-    id: int
+    id: Union[str, int]  # Acepta tanto strings como integers
     name: str
     username: Optional[str] = None
     email: Optional[str] = None
@@ -194,7 +197,17 @@ async def handle_pipefy_webhook(
     Recibe notificaciones webhook card.move de Pipefy.
     Obtiene la URL del adjunto vía GraphQL y lo procesa usando agentic-doc.
     """
-    card_id = payload.data.card.id
+    # También mantenemos el logging del cuerpo para diagnóstico
+    raw_body = await request.body()
+    logger.info("--- INICIO RAW BODY RECIBIDO ---")
+    try:
+        logger.info(raw_body.decode('utf-8'))
+    except Exception as e:
+        logger.error(f"Error decodificando body como UTF-8: {e}")
+    logger.info("--- FIN RAW BODY RECIBIDO ---")
+    
+    # Convertir IDs a string si es necesario
+    card_id = str(payload.data.card.id)
     logger.info(f"Webhook '{payload.data.action}' recibido para tarjeta ID: {card_id}")
 
     if PIPEFY_WEBHOOK_SECRET:
@@ -261,4 +274,32 @@ async def handle_pipefy_webhook(
 @app.get("/health")
 async def health_check():
     """Endpoint básico de verificación de salud."""
-    return {"status": "ok"} 
+    return {"status": "ok"}
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Manejador personalizado para errores de validación de Pydantic.
+    Proporciona un mensaje de error más amigable con detalles específicos.
+    """
+    logger.error(f"Error de validación: {exc}")
+    
+    # Formatea los errores
+    errors = []
+    for error in exc.errors():
+        error_loc = " -> ".join([str(loc) for loc in error["loc"]])
+        error_msg = error["msg"]
+        error_type = error.get("type", "unknown_error")
+        errors.append(f"Ubicación: {error_loc}, Error: {error_msg}, Tipo: {error_type}")
+    
+    error_detail = "\n".join(errors)
+    logger.error(f"Detalles del error de validación:\n{error_detail}")
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "Error al procesar la solicitud del webhook. Por favor, verifique el formato de los datos.",
+            "errors": exc.errors(),
+            "suggestion": "Asegúrese de que todos los campos del webhook tienen el formato correcto."
+        },
+    ) 
