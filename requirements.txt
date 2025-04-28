@@ -2,6 +2,7 @@ fastapi==0.109.2
 uvicorn[standard]==0.27.1
 requests==2.31.0
 python-dotenv==1.0.1
-pydantic==2.6.1
-agentic-doc==0.1.0
-python-multipart==0.0.9 
+pydantic
+agentic-doc==0.0.20
+python-multipart==0.0.9
+httpx 
