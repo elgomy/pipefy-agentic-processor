@@ -11,9 +11,6 @@ import httpx
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 import sys
-import hashlib
-import json
-from datetime import datetime, timedelta
 
 # Configuración
 load_dotenv()
@@ -23,12 +20,6 @@ PIPEFY_WEBHOOK_SECRET = os.getenv("RENDER_SERVICE_SECRET")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/data/output")
 PIPEFY_GRAPHQL_ENDPOINT = "https://api.pipefy.com/graphql"
 ATTACHMENT_FIELD_ID = os.getenv("PIPEFY_ATTACHMENT_FIELD_ID", "id_del_campo_adjunto")
-# Tiempo de validez del caché en segundos (5 minutos por defecto)
-CACHE_DURATION = int(os.getenv("CACHE_DURATION", "300"))
-
-# Diccionario para almacenar documentos ya procesados (caché)
-# {file_hash: {"timestamp": datetime, "output_path": str}}
-processed_docs_cache = {}
 
 # Configuración de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -259,37 +250,6 @@ async def download_file(attachment_url: str, card_id: str) -> Optional[str]:
             os.remove(local_filepath)
         return None
 
-def get_file_hash(file_path: str) -> str:
-    """Genera un hash único para un archivo basado en su contenido y metadatos."""
-    if not os.path.exists(file_path):
-        return ""
-    
-    try:
-        # Usamos el tamaño del archivo y la hora de modificación para un hash rápido
-        file_stat = os.stat(file_path)
-        file_size = file_stat.st_size
-        file_mtime = file_stat.st_mtime
-        
-        # Para archivos pequeños (< 10MB), también incluimos un hash del contenido
-        if file_size < 10 * 1024 * 1024:
-            with open(file_path, 'rb') as f:
-                file_content = f.read()
-                content_hash = hashlib.md5(file_content).hexdigest()
-        else:
-            # Para archivos grandes, leemos solo los primeros y últimos 1MB
-            with open(file_path, 'rb') as f:
-                first_mb = f.read(1024 * 1024)
-                f.seek(max(0, file_size - 1024 * 1024))
-                last_mb = f.read(1024 * 1024)
-                content_hash = hashlib.md5(first_mb + last_mb).hexdigest()
-        
-        # Combinamos toda la información en un solo hash
-        combined_data = f"{file_path}:{file_size}:{file_mtime}:{content_hash}"
-        return hashlib.md5(combined_data.encode()).hexdigest()
-    except Exception as e:
-        logger.error(f"Error generando hash para archivo {file_path}: {e}")
-        return ""
-
 def save_results(card_id: str, markdown_content: str, chunks: list):
     """Guarda los resultados procesados."""
     try:
@@ -299,10 +259,9 @@ def save_results(card_id: str, markdown_content: str, chunks: list):
         with open(md_filename, "w", encoding="utf-8") as f:
             f.write(markdown_content)
         logger.info(f"Resultados Markdown guardados para tarjeta {card_id} en {md_filename}")
-        return md_filename
+
     except Exception as e:
         logger.error(f"Error guardando resultados para tarjeta {card_id}: {e}")
-        return None
 
 @app.post("/webhook/pipefy")
 async def handle_pipefy_webhook(
@@ -351,32 +310,6 @@ async def handle_pipefy_webhook(
         raise HTTPException(status_code=500, detail="Error al descargar archivo adjunto de Pipefy.")
 
     try:
-        # Generar hash único para este archivo
-        file_hash = get_file_hash(downloaded_file_path)
-        logger.info(f"Hash generado para archivo {downloaded_file_path}: {file_hash}")
-        
-        # Verificar si este documento ya ha sido procesado recientemente
-        if file_hash in processed_docs_cache:
-            cache_entry = processed_docs_cache[file_hash]
-            cache_time = cache_entry["timestamp"]
-            now = datetime.now()
-            
-            # Si el documento está en caché y el caché aún es válido
-            if now - cache_time < timedelta(seconds=CACHE_DURATION):
-                logger.info(f"Documento ya procesado recientemente (hace {(now - cache_time).total_seconds()} segundos). Usando resultados en caché.")
-                
-                # Verificar si el archivo de resultados aún existe
-                result_path = cache_entry.get("output_path")
-                if result_path and os.path.exists(result_path):
-                    logger.info(f"Usando resultados en caché para tarjeta {card_id} desde {result_path}")
-                    
-                    # Limpiar archivos temporales
-                    if downloaded_file_path and os.path.exists(downloaded_file_path):
-                        os.remove(downloaded_file_path)
-                        logger.info(f"Archivo temporal limpiado: {downloaded_file_path}")
-                    
-                    return {"status": "success", "message": f"Adjunto ya procesado recientemente para tarjeta {card_id}", "cached": True}
-        
         logger.info(f"Iniciando procesamiento con agentic-doc para archivo: {downloaded_file_path}")
         
         if not VISION_AGENT_API_KEY:
@@ -391,24 +324,7 @@ async def handle_pipefy_webhook(
         parsed_doc = results[0]
         logger.info(f"Documento procesado exitosamente para tarjeta {card_id} con agentic-doc.")
 
-        output_path = save_results(card_id, parsed_doc.markdown, parsed_doc.chunks)
-        
-        # Actualizar caché con este documento procesado
-        if file_hash and output_path:
-            processed_docs_cache[file_hash] = {
-                "timestamp": datetime.now(),
-                "output_path": output_path
-            }
-            logger.info(f"Documento añadido a caché con hash {file_hash}")
-            
-            # Limpiar caché de entradas antiguas
-            now = datetime.now()
-            expired_keys = [k for k, v in processed_docs_cache.items() 
-                           if now - v["timestamp"] > timedelta(seconds=CACHE_DURATION)]
-            for key in expired_keys:
-                del processed_docs_cache[key]
-            if expired_keys:
-                logger.info(f"Limpieza de caché: eliminadas {len(expired_keys)} entradas antiguas")
+        save_results(card_id, parsed_doc.markdown, parsed_doc.chunks)
 
     except Exception as e:
         logger.error(f"Error durante el procesamiento con agentic-doc o guardando resultados para {downloaded_file_path}: {e}", exc_info=True)
