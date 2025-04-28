@@ -11,6 +11,9 @@ import httpx
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 import sys
+import hashlib
+import json
+from datetime import datetime, timedelta
 
 # Configuración
 load_dotenv()
@@ -20,6 +23,12 @@ PIPEFY_WEBHOOK_SECRET = os.getenv("RENDER_SERVICE_SECRET")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/data/output")
 PIPEFY_GRAPHQL_ENDPOINT = "https://api.pipefy.com/graphql"
 ATTACHMENT_FIELD_ID = os.getenv("PIPEFY_ATTACHMENT_FIELD_ID", "id_del_campo_adjunto")
+# Tiempo de validez del caché en segundos (5 minutos por defecto)
+CACHE_DURATION = int(os.getenv("CACHE_DURATION", "300"))
+
+# Diccionario para almacenar documentos ya procesados (caché)
+# {file_hash: {"timestamp": datetime, "output_path": str}}
+processed_docs_cache = {}
 
 # Configuración de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -75,13 +84,20 @@ async def get_pipefy_attachment_url(card_id: str) -> Optional[str]:
         "Authorization": f"Bearer {PIPEFY_TOKEN}",
         "Content-Type": "application/json",
     }
+    # Primer paso: Obtener los IDs de los adjuntos disponibles para esta tarjeta
     query = f"""
-    query GetCardAttachmentUrl {{
+    query GetCardAttachments {{
       card(id: "{card_id}") {{
-        fields(id: "{ATTACHMENT_FIELD_ID}") {{
+        attachments {{
+          path
+          url
+        }}
+        fields {{
           name
+          field {{
+            id
+          }}
           value
-          url_value
           array_value
         }}
       }}
@@ -89,40 +105,54 @@ async def get_pipefy_attachment_url(card_id: str) -> Optional[str]:
     """
     async with httpx.AsyncClient(timeout=20.0) as client:
         try:
-            logger.info(f"Consultando API GraphQL de Pipefy para adjunto de tarjeta {card_id} (campo: {ATTACHMENT_FIELD_ID})...")
+            logger.info(f"Consultando API GraphQL de Pipefy para adjuntos de tarjeta {card_id}...")
             response = await client.post(PIPEFY_GRAPHQL_ENDPOINT, json={'query': query}, headers=headers)
             response.raise_for_status()
             data = response.json()
 
             if 'errors' in data:
-                logger.error(f"Error en GraphQL al obtener adjunto para tarjeta {card_id}: {data['errors']}")
+                logger.error(f"Error en GraphQL al obtener adjuntos para tarjeta {card_id}: {data['errors']}")
                 return None
 
             card_data = data.get('data', {}).get('card')
-            if not card_data or not card_data.get('fields'):
-                logger.warning(f"No se encontraron campos o la tarjeta {card_id} en la respuesta GraphQL.")
+            if not card_data:
+                logger.warning(f"No se encontró la tarjeta {card_id} en la respuesta GraphQL.")
+                return None
+            
+            # Primero verificamos si hay attachments directos
+            if card_data.get('attachments') and len(card_data['attachments']) > 0:
+                for attachment in card_data['attachments']:
+                    if attachment.get('url'):
+                        logger.info(f"URL de adjunto encontrada para tarjeta {card_id}: {attachment['url']}")
+                        return attachment['url']
+            
+            # Si no hay attachments directos, buscamos en los campos
+            if not card_data.get('fields'):
+                logger.warning(f"No se encontraron campos para la tarjeta {card_id}.")
                 return None
 
-            base_url_pipefy = "https://app.pipefy.com"
+            # Buscar el campo de archivo adjunto por su ID
             for field_info in card_data['fields']:
-                 if field_info.get('url_value'):
-                     logger.info(f"URL encontrada en 'url_value' para tarjeta {card_id}.")
-                     return field_info['url_value']
-                 if isinstance(field_info.get('value'), str) and field_info['value'].startswith('http'):
-                      logger.info(f"URL encontrada en 'value' para tarjeta {card_id}.")
-                      return field_info['value']
-                 if field_info.get('array_value') and isinstance(field_info['array_value'], list) and len(field_info['array_value']) > 0:
-                     relative_path = field_info['array_value'][0]
-                     if isinstance(relative_path, str):
-                         if relative_path.startswith('http'):
-                             logger.info(f"URL absoluta encontrada en 'array_value' para tarjeta {card_id}.")
-                             return relative_path
-                         elif '/' in relative_path:
-                             full_url = f"{base_url_pipefy}{relative_path if relative_path.startswith('/') else '/' + relative_path}"
-                             logger.info(f"URL relativa construida desde 'array_value' para tarjeta {card_id}: {full_url}")
-                             return full_url
-                 logger.warning(f"Campo de adjunto {ATTACHMENT_FIELD_ID} encontrado para tarjeta {card_id}, pero no se pudo extraer una URL válida de: {field_info}")
-                 return None
+                field_id = field_info.get('field', {}).get('id')
+                if field_id == ATTACHMENT_FIELD_ID:
+                    logger.info(f"Campo de adjunto encontrado para tarjeta {card_id}.")
+                    
+                    # Si hay un valor de array que contiene archivos
+                    if field_info.get('array_value') and isinstance(field_info['array_value'], list) and len(field_info['array_value']) > 0:
+                        attachment_info = field_info['array_value'][0]
+                        logger.info(f"Información de adjunto en array_value: {attachment_info}")
+                        # Podría ser una URL directa o un identificador
+                        if isinstance(attachment_info, str):
+                            if attachment_info.startswith('http'):
+                                return attachment_info
+                    
+                    # Si hay un valor simple que es una URL
+                    if isinstance(field_info.get('value'), str) and field_info['value'].startswith('http'):
+                        logger.info(f"URL encontrada en 'value' para tarjeta {card_id}.")
+                        return field_info['value']
+                    
+                    logger.warning(f"Campo de adjunto {ATTACHMENT_FIELD_ID} encontrado para tarjeta {card_id}, pero no se pudo extraer URL.")
+                    return None
 
             logger.warning(f"Campo de adjunto con ID '{ATTACHMENT_FIELD_ID}' no encontrado para tarjeta {card_id}.")
             return None
@@ -134,28 +164,83 @@ async def get_pipefy_attachment_url(card_id: str) -> Optional[str]:
             logger.error(f"Error inesperado procesando respuesta GraphQL para tarjeta {card_id}: {e}")
             return None
 
-def download_file(url: str, card_id: str) -> Optional[str]:
-    """Descarga un archivo desde una URL (puede ser firmada o no)."""
+async def get_pipefy_attachment_download_url(attachment_id: str) -> Optional[str]:
+    """Obtiene la URL firmada de descarga para un adjunto de Pipefy utilizando su ID."""
+    if not PIPEFY_TOKEN:
+        logger.error("PIPEFY_TOKEN no configurado. No se puede obtener URL de descarga.")
+        return None
+    
+    headers = {
+        "Authorization": f"Bearer {PIPEFY_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    
+    # Query GraphQL para obtener la URL de descarga directa usando getPresignedUrl
+    query = f"""
+    query GetPresignedUrl {{
+      getPresignedUrl(input: {{ attachableId: "{attachment_id}" }}) {{
+        signedUrl
+      }}
+    }}
+    """
+    
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        try:
+            logger.info(f"Consultando API GraphQL de Pipefy para URL firmada del adjunto: {attachment_id}...")
+            response = await client.post(PIPEFY_GRAPHQL_ENDPOINT, json={'query': query}, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'errors' in data:
+                logger.error(f"Error en GraphQL al obtener URL firmada: {data['errors']}")
+                return None
+            
+            signed_url = data.get('data', {}).get('getPresignedUrl', {}).get('signedUrl')
+            if not signed_url:
+                logger.warning(f"No se pudo obtener URL firmada para el adjunto {attachment_id}")
+                return None
+            
+            logger.info(f"URL firmada obtenida exitosamente para adjunto {attachment_id}")
+            return signed_url
+            
+        except httpx.RequestError as e:
+            logger.error(f"Error de red obteniendo URL firmada para adjunto {attachment_id}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error inesperado obteniendo URL firmada para adjunto {attachment_id}: {e}")
+            return None
+
+async def download_file(attachment_url: str, card_id: str) -> Optional[str]:
+    """Descarga un archivo de Pipefy usando la URL del adjunto."""
     if not PIPEFY_TOKEN:
         logger.error("Variable de entorno PIPEFY_TOKEN no configurada.")
         return None
-    if not url:
+    if not attachment_url:
         logger.warning(f"No se proporcionó URL de adjunto para la tarjeta {card_id}.")
         return None
-        
+    
     headers = {"Authorization": f"Bearer {PIPEFY_TOKEN}"}
     local_filepath = None
+    
     try:
+        # Crear directorio de salida si no existe
         os.makedirs(OUTPUT_DIR, exist_ok=True)
+        
+        # Determinar la extensión del archivo
         try:
-             file_ext = os.path.splitext(url.split('?')[0].split('/')[-1])[1] or ".tmp"
+            # Intentar extraer la extensión de la URL
+            url_parts = attachment_url.split('?')[0].split('/')[-1]
+            file_ext = os.path.splitext(url_parts)[1] or ".tmp"
         except Exception:
-             file_ext = ".tmp"
+            file_ext = ".tmp"
+            
         temp_filename = f"{card_id}_{uuid.uuid4()}{file_ext}"
         local_filepath = os.path.join(OUTPUT_DIR, temp_filename)
 
-        logger.info(f"Intentando descargar adjunto para tarjeta {card_id} desde {url} a {local_filepath}")
-        with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+        logger.info(f"Intentando descargar adjunto para tarjeta {card_id} desde {attachment_url} a {local_filepath}")
+        
+        # Descargar usando la URL
+        with requests.get(attachment_url, headers=headers, stream=True, timeout=60) as r:
             r.raise_for_status()
             with open(local_filepath, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
@@ -164,7 +249,7 @@ def download_file(url: str, card_id: str) -> Optional[str]:
             return local_filepath
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error descargando archivo para tarjeta {card_id} desde {url}: {e}")
+        logger.error(f"Error descargando archivo para tarjeta {card_id}: {e}")
         if local_filepath and os.path.exists(local_filepath):
             os.remove(local_filepath)
         return None
@@ -173,6 +258,37 @@ def download_file(url: str, card_id: str) -> Optional[str]:
         if local_filepath and os.path.exists(local_filepath):
             os.remove(local_filepath)
         return None
+
+def get_file_hash(file_path: str) -> str:
+    """Genera un hash único para un archivo basado en su contenido y metadatos."""
+    if not os.path.exists(file_path):
+        return ""
+    
+    try:
+        # Usamos el tamaño del archivo y la hora de modificación para un hash rápido
+        file_stat = os.stat(file_path)
+        file_size = file_stat.st_size
+        file_mtime = file_stat.st_mtime
+        
+        # Para archivos pequeños (< 10MB), también incluimos un hash del contenido
+        if file_size < 10 * 1024 * 1024:
+            with open(file_path, 'rb') as f:
+                file_content = f.read()
+                content_hash = hashlib.md5(file_content).hexdigest()
+        else:
+            # Para archivos grandes, leemos solo los primeros y últimos 1MB
+            with open(file_path, 'rb') as f:
+                first_mb = f.read(1024 * 1024)
+                f.seek(max(0, file_size - 1024 * 1024))
+                last_mb = f.read(1024 * 1024)
+                content_hash = hashlib.md5(first_mb + last_mb).hexdigest()
+        
+        # Combinamos toda la información en un solo hash
+        combined_data = f"{file_path}:{file_size}:{file_mtime}:{content_hash}"
+        return hashlib.md5(combined_data.encode()).hexdigest()
+    except Exception as e:
+        logger.error(f"Error generando hash para archivo {file_path}: {e}")
+        return ""
 
 def save_results(card_id: str, markdown_content: str, chunks: list):
     """Guarda los resultados procesados."""
@@ -183,9 +299,10 @@ def save_results(card_id: str, markdown_content: str, chunks: list):
         with open(md_filename, "w", encoding="utf-8") as f:
             f.write(markdown_content)
         logger.info(f"Resultados Markdown guardados para tarjeta {card_id} en {md_filename}")
-
+        return md_filename
     except Exception as e:
         logger.error(f"Error guardando resultados para tarjeta {card_id}: {e}")
+        return None
 
 @app.post("/webhook/pipefy")
 async def handle_pipefy_webhook(
@@ -227,13 +344,39 @@ async def handle_pipefy_webhook(
         logger.warning(f"No se pudo obtener URL de adjunto para tarjeta {card_id} o no existe. Omitiendo procesamiento del adjunto.")
         return {"status": "success", "message": f"Webhook recibido para tarjeta {card_id}, pero no se procesó adjunto."}
 
-    downloaded_file_path = download_file(attachment_url, card_id)
+    downloaded_file_path = await download_file(attachment_url, card_id)
 
     if not downloaded_file_path:
         logger.error(f"Fallo al descargar adjunto desde {attachment_url} para tarjeta {card_id}. Abortando.")
         raise HTTPException(status_code=500, detail="Error al descargar archivo adjunto de Pipefy.")
 
     try:
+        # Generar hash único para este archivo
+        file_hash = get_file_hash(downloaded_file_path)
+        logger.info(f"Hash generado para archivo {downloaded_file_path}: {file_hash}")
+        
+        # Verificar si este documento ya ha sido procesado recientemente
+        if file_hash in processed_docs_cache:
+            cache_entry = processed_docs_cache[file_hash]
+            cache_time = cache_entry["timestamp"]
+            now = datetime.now()
+            
+            # Si el documento está en caché y el caché aún es válido
+            if now - cache_time < timedelta(seconds=CACHE_DURATION):
+                logger.info(f"Documento ya procesado recientemente (hace {(now - cache_time).total_seconds()} segundos). Usando resultados en caché.")
+                
+                # Verificar si el archivo de resultados aún existe
+                result_path = cache_entry.get("output_path")
+                if result_path and os.path.exists(result_path):
+                    logger.info(f"Usando resultados en caché para tarjeta {card_id} desde {result_path}")
+                    
+                    # Limpiar archivos temporales
+                    if downloaded_file_path and os.path.exists(downloaded_file_path):
+                        os.remove(downloaded_file_path)
+                        logger.info(f"Archivo temporal limpiado: {downloaded_file_path}")
+                    
+                    return {"status": "success", "message": f"Adjunto ya procesado recientemente para tarjeta {card_id}", "cached": True}
+        
         logger.info(f"Iniciando procesamiento con agentic-doc para archivo: {downloaded_file_path}")
         
         if not VISION_AGENT_API_KEY:
@@ -248,7 +391,24 @@ async def handle_pipefy_webhook(
         parsed_doc = results[0]
         logger.info(f"Documento procesado exitosamente para tarjeta {card_id} con agentic-doc.")
 
-        save_results(card_id, parsed_doc.markdown, parsed_doc.chunks)
+        output_path = save_results(card_id, parsed_doc.markdown, parsed_doc.chunks)
+        
+        # Actualizar caché con este documento procesado
+        if file_hash and output_path:
+            processed_docs_cache[file_hash] = {
+                "timestamp": datetime.now(),
+                "output_path": output_path
+            }
+            logger.info(f"Documento añadido a caché con hash {file_hash}")
+            
+            # Limpiar caché de entradas antiguas
+            now = datetime.now()
+            expired_keys = [k for k, v in processed_docs_cache.items() 
+                           if now - v["timestamp"] > timedelta(seconds=CACHE_DURATION)]
+            for key in expired_keys:
+                del processed_docs_cache[key]
+            if expired_keys:
+                logger.info(f"Limpieza de caché: eliminadas {len(expired_keys)} entradas antiguas")
 
     except Exception as e:
         logger.error(f"Error durante el procesamiento con agentic-doc o guardando resultados para {downloaded_file_path}: {e}", exc_info=True)
