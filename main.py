@@ -14,6 +14,7 @@ import sys
 import json
 import hashlib
 from datetime import datetime, timedelta
+import time
 
 # Configuración
 load_dotenv()
@@ -33,6 +34,12 @@ logger = logging.getLogger(__name__)
 DOCUMENT_CACHE = {}
 # Tiempo de expiración del caché en horas
 CACHE_EXPIRY_HOURS = 24
+
+# Caché para deduplicación de webhooks
+# Estructura: {webhook_id: {"timestamp": datetime, "card_id": str}}
+WEBHOOK_CACHE = {}
+# Tiempo de expiración de la deduplicación de webhooks (en segundos)
+WEBHOOK_DEDUP_EXPIRY = 60  # 1 minuto 
 
 # Sistema de caché para documentos
 def get_file_hash(filepath: str) -> str:
@@ -99,6 +106,52 @@ def clean_expired_cache_entries() -> None:
             logger.info(f"Limpiadas {len(expired_keys)} entradas expiradas de caché")
     except Exception as e:
         logger.error(f"Error limpiando entradas expiradas de caché: {e}")
+
+# Sistema de deduplicación de webhooks
+def generate_webhook_id(payload: dict, card_id: str) -> str:
+    """Genera un ID único para un webhook basado en su contenido y tarjeta."""
+    webhook_data = f"{card_id}_{json.dumps(payload, sort_keys=True)}"
+    return hashlib.md5(webhook_data.encode()).hexdigest()
+
+def is_duplicate_webhook(webhook_id: str, card_id: str) -> bool:
+    """Verifica si un webhook es duplicado basado en su ID."""
+    try:
+        clean_expired_webhook_entries()
+        
+        if webhook_id in WEBHOOK_CACHE:
+            webhook_info = WEBHOOK_CACHE[webhook_id]
+            elapsed = time.time() - webhook_info.get("timestamp", 0)
+            logger.info(f"Webhook duplicado detectado para tarjeta {card_id}, ID: {webhook_id}, hace {elapsed:.2f} segundos")
+            return True
+        
+        # No está en caché, lo añadimos
+        WEBHOOK_CACHE[webhook_id] = {
+            "timestamp": time.time(),
+            "card_id": card_id
+        }
+        return False
+    except Exception as e:
+        logger.error(f"Error verificando duplicación de webhook {webhook_id}: {e}")
+        return False  # En caso de error, procesamos el webhook
+
+def clean_expired_webhook_entries() -> None:
+    """Limpia entradas expiradas del caché de webhooks."""
+    try:
+        now = time.time()
+        expired_keys = []
+        
+        for webhook_id, entry in WEBHOOK_CACHE.items():
+            cache_time = entry.get("timestamp", 0)
+            if now - cache_time > WEBHOOK_DEDUP_EXPIRY:
+                expired_keys.append(webhook_id)
+        
+        for key in expired_keys:
+            del WEBHOOK_CACHE[key]
+            
+        if expired_keys:
+            logger.info(f"Limpiadas {len(expired_keys)} entradas expiradas de caché de webhooks")
+    except Exception as e:
+        logger.error(f"Error limpiando entradas expiradas de caché de webhooks: {e}")
 
 # --- Nuevos Modelos Pydantic para el Payload card.move ---
 
@@ -358,9 +411,20 @@ async def handle_pipefy_webhook(
     raw_body = await request.body()
     logger.info("--- INICIO RAW BODY RECIBIDO ---")
     try:
-        logger.info(raw_body.decode('utf-8'))
+        raw_body_str = raw_body.decode('utf-8')
+        logger.info(raw_body_str)
+        
+        # Verificar duplicación del webhook
+        card_id = str(payload.data.card.id)
+        webhook_id = generate_webhook_id(json.loads(raw_body_str), card_id)
+        
+        if is_duplicate_webhook(webhook_id, card_id):
+            logger.info(f"Omitiendo procesamiento de webhook duplicado para tarjeta {card_id}")
+            return {"status": "success", "message": f"Webhook duplicado para tarjeta {card_id}, ignorado", "duplicate": True}
+            
     except Exception as e:
-        logger.error(f"Error decodificando body como UTF-8: {e}")
+        logger.error(f"Error procesando raw body o verificando duplicación: {e}")
+        # Continuamos con el procesamiento normal en caso de error
     logger.info("--- FIN RAW BODY RECIBIDO ---")
     
     # Convertir IDs a string si es necesario
