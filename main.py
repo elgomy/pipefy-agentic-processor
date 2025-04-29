@@ -21,7 +21,7 @@ load_dotenv()
 PIPEFY_TOKEN = os.getenv("PIPEFY_TOKEN")
 VISION_AGENT_API_KEY = os.getenv("VISION_AGENT_API_KEY")
 PIPEFY_WEBHOOK_SECRET = os.getenv("RENDER_SERVICE_SECRET") or os.getenv("PIPEFY_WEBHOOK_SECRET")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/data/output")
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/data")
 PIPEFY_GRAPHQL_ENDPOINT = "https://api.pipefy.com/graphql"
 ATTACHMENT_FIELD_ID = os.getenv("PIPEFY_ATTACHMENT_FIELD_ID", "id_del_campo_adjunto")
 
@@ -384,17 +384,35 @@ def save_results(card_id: str, markdown_content: str, chunks: list) -> str:
     Retorna la ruta del archivo Markdown generado.
     """
     try:
+        logger.info(f"Creando directorio de salida: {OUTPUT_DIR}")
         os.makedirs(OUTPUT_DIR, exist_ok=True)
+        
+        # Verificar que el directorio existe realmente
+        if not os.path.exists(OUTPUT_DIR):
+            logger.error(f"¡ALERTA! No se pudo crear el directorio {OUTPUT_DIR}")
+            # Intentar crear directamente /data
+            os.makedirs("/data", exist_ok=True)
+            if os.path.exists("/data"):
+                logger.info("Directorio /data existe y es accesible")
+            else:
+                logger.error("¡ALERTA! No se puede acceder al directorio /data")
 
         md_filename = os.path.join(OUTPUT_DIR, f"{card_id}_extracted.md")
+        logger.info(f"Guardando resultados en: {md_filename}")
+        
         with open(md_filename, "w", encoding="utf-8") as f:
             f.write(markdown_content)
-        logger.info(f"Resultados Markdown guardados para tarjeta {card_id} en {md_filename}")
         
+        # Verificar que el archivo se ha creado
+        if os.path.exists(md_filename):
+            logger.info(f"Archivo guardado exitosamente: {md_filename} ({os.path.getsize(md_filename)} bytes)")
+        else:
+            logger.error(f"¡ALERTA! No se pudo verificar la existencia del archivo: {md_filename}")
+            
         return md_filename
 
     except Exception as e:
-        logger.error(f"Error guardando resultados para tarjeta {card_id}: {e}")
+        logger.error(f"Error guardando resultados para tarjeta {card_id}: {e}", exc_info=True)
         return ""
 
 @app.post("/webhook/pipefy")
@@ -542,4 +560,80 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "errors": exc.errors(),
             "suggestion": "Asegúrese de que todos los campos del webhook tienen el formato correcto."
         },
-    ) 
+    )
+
+@app.get("/archivos")
+async def list_files():
+    """Endpoint para listar los archivos disponibles en el directorio de salida."""
+    try:
+        if not os.path.exists(OUTPUT_DIR):
+            logger.warning(f"El directorio {OUTPUT_DIR} no existe")
+            return {"status": "error", "message": f"El directorio {OUTPUT_DIR} no existe"}
+            
+        files = []
+        for filename in os.listdir(OUTPUT_DIR):
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            if os.path.isfile(filepath):
+                file_info = {
+                    "nombre": filename,
+                    "tamaño": os.path.getsize(filepath),
+                    "modificado": os.path.getmtime(filepath),
+                    "ruta": filepath
+                }
+                files.append(file_info)
+                
+        # Verifica también el directorio raíz /data por si acaso
+        data_files = []
+        if os.path.exists("/data") and OUTPUT_DIR != "/data":
+            for filename in os.listdir("/data"):
+                filepath = os.path.join("/data", filename)
+                if os.path.isfile(filepath):
+                    file_info = {
+                        "nombre": filename,
+                        "tamaño": os.path.getsize(filepath),
+                        "modificado": os.path.getmtime(filepath),
+                        "ruta": filepath
+                    }
+                    data_files.append(file_info)
+                    
+        return {
+            "status": "success", 
+            "archivos": files,
+            "archivos_data": data_files if OUTPUT_DIR != "/data" else [],
+            "directorio": OUTPUT_DIR,
+            "disco_persistente": "/data"
+        }
+    except Exception as e:
+        logger.error(f"Error listando archivos: {e}", exc_info=True)
+        return {"status": "error", "message": f"Error listando archivos: {str(e)}"}
+
+@app.get("/archivo/{card_id}")
+async def get_file_content(card_id: str):
+    """Endpoint para obtener el contenido de un archivo específico."""
+    try:
+        filename = f"{card_id}_extracted.md"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        
+        if not os.path.exists(filepath):
+            logger.warning(f"Archivo no encontrado: {filepath}")
+            # Buscar en directorio raíz como plan B
+            alt_filepath = os.path.join("/data", filename)
+            if os.path.exists(alt_filepath):
+                filepath = alt_filepath
+                logger.info(f"Archivo encontrado en ruta alternativa: {filepath}")
+            else:
+                return {"status": "error", "message": "Archivo no encontrado"}
+                
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+            
+        return {
+            "status": "success",
+            "card_id": card_id,
+            "filename": filename,
+            "content": content,
+            "filepath": filepath
+        }
+    except Exception as e:
+        logger.error(f"Error leyendo archivo para tarjeta {card_id}: {e}", exc_info=True)
+        return {"status": "error", "message": f"Error leyendo archivo: {str(e)}"} 
